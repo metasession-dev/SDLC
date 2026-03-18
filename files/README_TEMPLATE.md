@@ -275,3 +275,165 @@ Run through the entire pipeline: plan the requirement, implement it, compile
 evidence, create the PR, and after approval, deploy. This is a straightforward
 change so it should be Low risk.
 ```
+
+---
+
+## META-COMPLY Integration
+
+META-COMPLY is the centralised compliance evidence portal for all Metasession projects. It replaces git-based evidence storage with a web application that provides secure, auditor-accessible evidence management.
+
+**What changes when META-COMPLY is active:**
+
+### Evidence Storage (Workflow 3: Compile Evidence)
+
+Evidence artifacts are uploaded to META-COMPLY instead of being committed to git.
+
+| Before (git-based) | After (META-COMPLY) |
+|---------------------|---------------------|
+| `cp e2e-results.json compliance/evidence/REQ-XXX/` | CLI script or CI uploads to META-COMPLY |
+| `git add compliance/evidence/REQ-XXX/` | Binary artifacts excluded via `.gitignore` |
+| Evidence only visible to repo collaborators | Evidence visible to anyone with an access grant |
+| Screenshots bloat git history permanently | Files stored in Supabase Storage, not git |
+
+**What stays in git:**
+- `compliance/RTM.md` — source of truth for requirement tracking
+- `compliance/test-plan.md` — project test plan
+- `compliance/test-cases.md` — test case specifications
+- `compliance/test-summary-report.md` — test execution summary
+- `compliance/evidence/REQ-XXX/test-scope.md` — pre-implementation test scope (text, not binary)
+- `compliance/evidence/REQ-XXX/ai-use-note.md` — AI involvement records (text)
+- `compliance/evidence/REQ-XXX/security-summary.md` — security summary (text)
+- Release tickets in `compliance/pending-releases/` and `compliance/approved-releases/`
+
+**What moves to META-COMPLY:**
+- Screenshots (PNG, JPEG) from E2E test runs
+- `e2e-results.json` and other generated test result files
+- `sast-results.json` and `dependency-audit.json`
+- Playwright HTML reports
+- Any other binary or generated artifacts
+
+### Compliance Document Syncing
+
+CI automatically uploads read-only snapshots of the compliance source documents (RTM, test plan, test cases, test summary report) to META-COMPLY on every merge to `main`. Auditors see the full compliance picture — planning documents alongside evidence — in one place, without needing repository access.
+
+The source of truth for these documents remains in git. Developers continue to edit them as part of the normal workflow. META-COMPLY holds read-only copies tagged with the git SHA they were synced from.
+
+### CI Pipeline Changes
+
+Add the META-COMPLY evidence upload step to your CI workflow, after tests pass:
+
+```yaml
+# Add to .github/workflows/ci.yml, after the E2E test job
+upload-evidence:
+  name: Upload Evidence to META-COMPLY
+  runs-on: ubuntu-latest
+  needs: [e2e-tests]
+  if: github.event_name == 'pull_request'
+  steps:
+    - uses: actions/checkout@v4
+
+    # Upload test artifacts
+    - name: Upload E2E evidence
+      run: |
+        ./scripts/upload-evidence.sh \
+          --project [PROJECT_SLUG] \
+          --requirement "${{ github.event.pull_request.title }}" \
+          --type e2e_result \
+          --git-sha "${{ github.sha }}" \
+          --ci-run-id "${{ github.run_id }}" \
+          --path playwright-report/
+      env:
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+    # Upload security evidence
+    - name: Upload SAST evidence
+      run: |
+        ./scripts/upload-evidence.sh \
+          --project [PROJECT_SLUG] \
+          --requirement "${{ github.event.pull_request.title }}" \
+          --type test_report \
+          --git-sha "${{ github.sha }}" \
+          --path sast-results.json
+      env:
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+
+# Sync compliance docs on merge to main
+sync-compliance-docs:
+  name: Sync Compliance Documents
+  runs-on: ubuntu-latest
+  if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  steps:
+    - uses: actions/checkout@v4
+    - name: Upload compliance documents
+      run: |
+        for doc in compliance/RTM.md compliance/test-plan.md compliance/test-cases.md compliance/test-summary-report.md; do
+          [ -f "$doc" ] && ./scripts/upload-evidence.sh \
+            --project [PROJECT_SLUG] \
+            --requirement _compliance-docs \
+            --type compliance_document \
+            --git-sha "${{ github.sha }}" \
+            --path "$doc"
+        done
+      env:
+        SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+```
+
+### .gitignore Updates
+
+Add to your project's `.gitignore` to stop tracking binary evidence:
+
+```gitignore
+# Compliance binary evidence (stored in META-COMPLY)
+compliance/evidence/**/*.json
+compliance/evidence/**/*.png
+compliance/evidence/**/*.jpeg
+compliance/evidence/**/*.html
+compliance/evidence/**/screenshots/
+compliance/evidence/**/playwright-report/
+compliance/evidence/adhoc-*/
+```
+
+### Workflow 3 Prompt (Updated)
+
+When META-COMPLY is active, the evidence compilation prompt changes:
+
+```
+Read 3-compile-evidence.md and compile all evidence for REQ-XXX.
+
+Verify all gates pass. For binary evidence (screenshots, JSON results,
+HTML reports), upload to META-COMPLY using the CLI script instead of
+committing to git. Keep text-based evidence (test-scope.md, security-summary.md,
+ai-use-note.md) in git. Update the RTM, generate the release ticket, and commit.
+```
+
+### Access for Auditors
+
+Project admins manage auditor access through META-COMPLY:
+
+1. Navigate to the project in META-COMPLY
+2. Go to Access Management
+3. Enter the auditor's email, select "viewer" role, set an optional expiry date
+4. The auditor receives a magic link email — no password required
+5. Revoke access at any time from the same page
+
+For one-off reviews, generate a time-limited share link instead of creating an account.
+
+### Required Secrets
+
+Add these to your GitHub repository secrets (Settings → Secrets → Actions):
+
+| Secret | Value | Source |
+|--------|-------|--------|
+| `SUPABASE_URL` | Your Supabase project URL | Supabase dashboard → Settings → API |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service role key (server-side only) | Supabase dashboard → Settings → API |
+
+### Project Registration
+
+Before CI can upload evidence, the project must be registered in META-COMPLY:
+
+1. Sign in to META-COMPLY as an admin
+2. Create a new project with the project slug matching `[PROJECT_SLUG]` used in CI
+3. The storage namespace and access grants are created automatically
