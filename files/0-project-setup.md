@@ -1,0 +1,444 @@
+---
+description: One-time project setup — configure repository, CI pipeline, compliance structure, and tooling before workflows can run
+---
+
+# Project Setup Guide
+
+**Document Type:** Setup Guide | **Run Once:** At project start, before any workflow is executed
+
+**Parent Documents:** Test Policy, Test Strategy, Test Architecture (all Tier 1)
+
+---
+
+## Purpose
+
+This guide configures a new project so that the five pipeline workflows can run correctly. It sets up the repository structure, branch protection, CI pipeline (the independent verification gate), compliance directories, and local tooling.
+
+**Run this guide once when starting a new project.** The pipeline workflows (1-5) assume this setup is complete.
+
+---
+
+## Prerequisites
+
+- GitHub repository created
+- Hosting platform configured (Railway, Vercel, AWS, etc.) with auto-deploy from `main`
+- Local development environment working (app builds and runs)
+- Node.js and npm installed
+- GitHub CLI (`gh`) installed and authenticated
+
+---
+
+## Step 1: Branch Structure
+
+Create the permanent working branch:
+
+```bash
+# Ensure main exists and is up to date
+git checkout main
+git pull origin main
+
+# Create develop branch
+git checkout -b develop
+git push origin develop
+```
+
+**Branch roles:**
+- `main` — Production. Auto-deploys. Never commit directly.
+- `develop` — All work happens here. Permanent, never deleted.
+
+---
+
+## Step 2: Branch Protection Rules
+
+Configure in GitHub → Settings → Branches → Branch protection rules:
+
+**`main` branch:**
+- [x] Require a pull request before merging
+- [x] Require approvals: 1 (adjust if team size requires more)
+- [x] Require status checks to pass before merging
+  - Add these required checks after CI is configured (Step 4):
+    - `typecheck`
+    - `sast`
+    - `dependency-audit`
+    - `e2e-tests`
+- [x] Require branches to be up to date before merging
+- [x] Do not allow bypassing the above settings
+
+**`develop` branch (optional but recommended):**
+- [x] Require status checks to pass (push-to-develop checks)
+
+---
+
+## Step 3: Compliance Directory Structure
+
+```bash
+# Create compliance directories
+mkdir -p compliance/evidence/periodic/{sast-quarterly,dependency-audit,access-control,audit-log,pentest,dr-test,third-party}
+mkdir -p compliance/pending-releases
+mkdir -p compliance/approved-releases
+
+# Create initial RTM
+cat > compliance/RTM.md << 'EOF'
+# Requirements Traceability Matrix
+
+**Project:** [PROJECT NAME]
+**Standard:** ISO/IEC/IEEE 29119-3:2021
+
+## Part A: Baseline Requirements
+
+| ID | Requirement | Source | Status |
+|---|---|---|---|
+
+## Part B: Change Request Traceability
+
+| REQ-ID | Description | Risk | Implementation | Evidence | Status | Approver | Date |
+|---|---|---|---|---|---|---|---|
+EOF
+
+# Commit
+git add compliance/
+git commit -m "compliance: initialize compliance directory structure"
+git push origin develop
+```
+
+---
+
+## Step 4: CI Pipeline Configuration
+
+This is the **independent verification gate**. Tests run locally during development (comprehensive, all tests). Tests run in CI during PR review (independent, tamper-resistant evidence produced by GitHub, not the developer).
+
+### What CI Must Run
+
+| Pipeline | Trigger | Jobs | Purpose |
+|---|---|---|---|
+| Develop CI | Push to `develop` | TypeScript check + build | Fast feedback |
+| PR CI | PR to `main` | TypeScript + SAST + dependency audit + E2E | Independent verification |
+| Deploy | Merge to `main` | Auto-deploy to hosting platform | Production release |
+
+### GitHub Actions Workflow File
+
+Create `.github/workflows/ci.yml`:
+
+```yaml
+name: CI Pipeline
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+    branches: [main]
+
+jobs:
+  # ──────────────────────────────────────────────
+  # JOB 1: TypeScript Compilation
+  # Runs on: push to develop + PR to main
+  # ──────────────────────────────────────────────
+  typecheck:
+    name: TypeScript Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'          # UPDATE: match your project's Node version
+          cache: 'npm'
+      - run: npm ci
+      - run: npx tsc --noEmit
+
+  # ──────────────────────────────────────────────
+  # JOB 2: SAST Scan (Semgrep)
+  # Runs on: PR to main only
+  # Independent security evidence
+  # ──────────────────────────────────────────────
+  sast:
+    name: SAST Scan
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install semgrep
+      - run: semgrep scan --config auto src/ --severity ERROR --severity WARNING --error
+        # --error flag makes semgrep exit with non-zero if findings exist
+      # Optional: upload results as artifact for audit evidence
+      - name: Save SAST results
+        if: always()
+        run: semgrep scan --config auto src/ --json > sast-results.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: sast-results
+          path: sast-results.json
+          retention-days: 90
+
+  # ──────────────────────────────────────────────
+  # JOB 3: Dependency Audit
+  # Runs on: PR to main only
+  # Independent supply chain evidence
+  # ──────────────────────────────────────────────
+  dependency-audit:
+    name: Dependency Audit
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'          # UPDATE: match your project's Node version
+          cache: 'npm'
+      - run: npm ci
+      - run: npm audit --audit-level=high
+      # Optional: save results for audit evidence
+      - name: Save audit results
+        if: always()
+        run: npm audit --json > dependency-audit.json || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dependency-audit
+          path: dependency-audit.json
+          retention-days: 90
+
+  # ──────────────────────────────────────────────
+  # JOB 4: E2E Tests (Playwright)
+  # Runs on: PR to main only
+  # Independent functional test evidence
+  # ──────────────────────────────────────────────
+  e2e-tests:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+
+    # UPDATE: Configure your database service
+    # Option A: MongoDB service container
+    services:
+      mongodb:
+        image: mongo:7
+        ports:
+          - 27017:27017
+        options: >-
+          --health-cmd "mongosh --eval 'db.runCommand({ping:1})'"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    # Option B: If using Docker Compose, remove the services block above
+    # and add a step: run: docker compose -f docker-compose.test.yml up -d
+
+    env:
+      # UPDATE: Set your project's required environment variables
+      MONGODB_URI: mongodb://localhost:27017
+      MONGODB_DB_NAME: testdb           # UPDATE: your test database name
+      NODE_ENV: test
+      # Add other env vars your app needs to start
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'            # UPDATE: match your project's Node version
+          cache: 'npm'
+      - run: npm ci
+      - run: npx playwright install chromium --with-deps
+
+      # Seed test data — required before running tests
+      - name: Seed test data
+        run: npx tsx scripts/seed-e2e-admins.ts    # UPDATE: your seed script path
+
+      # Run unauthenticated E2E tests only
+      # UPDATE: adjust the command to match your test configuration
+      # Options:
+      #   npx playwright test                        # all tests
+      #   npx playwright test --project=unauthenticated  # if using named projects
+      #   npx playwright test --grep-invert="@auth"  # exclude by tag
+      - name: Run E2E tests
+        run: npx playwright test
+
+      # Save test results for audit evidence
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: playwright-report
+          path: playwright-report/
+          retention-days: 90
+
+  # ──────────────────────────────────────────────
+  # Build verification (push to develop only)
+  # ──────────────────────────────────────────────
+  build:
+    name: Build Check
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'            # UPDATE: match your project's Node version
+          cache: 'npm'
+      - run: npm ci
+      - run: npm run build              # UPDATE: your build command
+```
+
+### Customization Checklist
+
+After creating the workflow file, update every line marked `# UPDATE`:
+
+- [ ] Node.js version matches your project
+- [ ] `src/` path in SAST scan matches your source directory
+- [ ] Database service matches your database (MongoDB, PostgreSQL, etc.)
+- [ ] Environment variables set for your app to start
+- [ ] Seed script path is correct
+- [ ] E2E test command runs the correct subset (unauthenticated for CI)
+- [ ] Build command is correct
+
+### Verify CI Works
+
+```bash
+# Commit the workflow file
+git add .github/workflows/ci.yml
+git commit -m "ci: configure CI pipeline with independent verification gates"
+git push origin develop
+
+# Create a test PR to verify all jobs pass
+gh pr create --base main --head develop --title "ci: verify pipeline configuration" --body "Testing CI pipeline setup"
+
+# Watch the checks run
+gh pr checks
+```
+
+Once all checks pass, go back to GitHub → Settings → Branches → `main` protection rules and add the job names as required status checks: `typecheck`, `sast`, `dependency-audit`, `e2e-tests`.
+
+Now the PR **cannot be merged** unless all four independent verification gates pass. This is enforced by GitHub, not by the developer.
+
+### After CI Is Configured
+
+The relationship between local testing and CI testing:
+
+```
+Developer Machine (comprehensive)          GitHub Actions (independent)
+─────────────────────────────────          ──────────────────────────────
+TypeScript check ──────────────────────→   TypeScript check
+SAST scan (Semgrep) ───────────────────→   SAST scan (Semgrep)
+Dependency audit ──────────────────────→   Dependency audit
+E2E tests (ALL — e.g., 183) ──────────→   E2E tests (unauthenticated subset)
+E2E tests (authenticated — local only)     ✗ (credentials not in CI)
+Post-deploy verification (local only)      ✗ (runs after merge)
+                                           
+Evidence → compliance/evidence/REQ-XXX/    Evidence → GitHub Actions logs + artifacts
+(comprehensive, developer-produced)        (independent, tamper-resistant)
+```
+
+Both are required. Local evidence proves comprehensive testing. CI evidence proves it independently.
+
+---
+
+## Step 5: Local Tooling Setup
+
+Install security scanning tools on the developer machine:
+
+```bash
+# SAST
+pip install semgrep
+# or: npm install --save-dev semgrep
+
+# Verify
+semgrep --version
+npm audit --help
+```
+
+Install Playwright:
+
+```bash
+npx playwright install chromium
+```
+
+Install commit tooling (per Test Architecture):
+
+```bash
+npm install --save-dev @commitlint/cli @commitlint/config-conventional husky
+npx husky install
+npm pkg set scripts.prepare="husky install"
+```
+
+---
+
+## Step 6: Create Project Test Plan
+
+Copy `Test_Plan_TEMPLATE.md` to `compliance/test-plan.md` and fill in:
+
+- [ ] Project name and repository
+- [ ] Stack and hosting details
+- [ ] Production URL and health endpoint
+- [ ] Database configuration
+- [ ] Test suite counts and framework
+- [ ] Entry/exit criteria with actual thresholds
+- [ ] AI tool permissions for this project
+- [ ] Disaster recovery targets (RTO/RPO)
+- [ ] Penetration test scope
+
+```bash
+git add compliance/test-plan.md
+git commit -m "compliance: project test plan"
+git push origin develop
+```
+
+---
+
+## Step 7: Verify Everything Works
+
+Run through the complete pipeline once with a small test change:
+
+```bash
+# 1. Plan (workflow 1)
+# Create a test requirement in RTM
+
+# 2. Implement (workflow 2)
+# Make a small change, run all local gates
+
+# 3. Compile evidence (workflow 3)
+# Generate compliance artifacts
+
+# 4. Submit for review (workflow 4)
+# Create PR — verify all CI checks run and pass
+
+# 5. Deploy (workflow 5)
+# Merge, verify deployment, finalize compliance
+```
+
+If any step fails, fix the configuration before starting real work.
+
+---
+
+## Setup Checklist
+
+| Step | Status |
+|---|---|
+| Repository created | [ ] |
+| `develop` branch created | [ ] |
+| Branch protection configured | [ ] |
+| Compliance directories created | [ ] |
+| RTM initialized | [ ] |
+| CI workflow file created (`.github/workflows/ci.yml`) | [ ] |
+| CI verified — all jobs pass on test PR | [ ] |
+| Required status checks added to branch protection | [ ] |
+| Local tooling installed (Semgrep, Playwright, Husky) | [ ] |
+| Project Test Plan created | [ ] |
+| End-to-end pipeline verified with test change | [ ] |
+
+---
+
+## What Happens Next
+
+With setup complete, all development follows the five pipeline workflows:
+
+```
+1-plan-requirement.md       → Define requirement, classify risk, generate test scope
+2-implement-and-test.md     → Code, commit, run all local gates
+3-compile-evidence.md       → Gather test + security + AI evidence
+4-submit-for-review.md      → Create PR (CI runs independent verification)
+5-deploy-main.md            → Merge, deploy, verify, finalize
+```
+
+The CI pipeline runs automatically on every PR. The developer doesn't need to trigger it — GitHub handles it. The branch protection rules prevent merging if CI fails. The human reviewer sees both local evidence (in the compliance directory) and CI evidence (in the PR checks) before approving.
